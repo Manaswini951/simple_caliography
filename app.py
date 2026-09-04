@@ -1,5 +1,6 @@
 import io
 import math
+import zipfile
 import cv2
 import numpy as np
 import streamlit as st
@@ -9,15 +10,15 @@ from PIL import Image
 # PAGE CONFIGURATION
 # ============================================================
 st.set_page_config(
-    page_title="Artistic Calligraphy Animator",
+    page_title="Artistic Calligraphy Animator (Batch)",
     page_icon="✒️",
     layout="wide",
 )
 
 st.title("✒️ Artistic Calligraphy Writing Animator")
 st.write(
-    "Upload calligraphy artwork to automatically extract strokes, clean background noise, "
-    "and generate realistic, smooth fluid-writing animations."
+    "Upload multiple calligraphy artwork images to automatically remove background noise, "
+    "extract clean letter strokes, and render smooth fluid-writing animations exported in a ZIP file."
 )
 
 # ============================================================
@@ -127,12 +128,10 @@ def generate_ordered_path(skeleton, direction="Left -> Right"):
 
     while remaining:
         cy, cx = current
-        # Find closest point
         nearest = min(remaining, key=lambda p: ((p[0] - cy) ** 2 + (p[1] - cx) ** 2))
         
-        # Avoid huge jumps (break up unconnected strokes)
         dist_sq = (nearest[0] - cy) ** 2 + (nearest[1] - cx) ** 2
-        if dist_sq > 2500:  # Threshold gap
+        if dist_sq > 2500:  # Gap threshold to separate distant strokes
             break
 
         path.append(nearest)
@@ -197,9 +196,6 @@ def ease_in_out(t):
 
 
 def render_artistic_nib(canvas, point, angle=45, nib_size=6, color=(20, 20, 20)):
-    """
-    Renders an angled calligraphic pen nib at the active stroke position.
-    """
     if point is None:
         return
     
@@ -214,11 +210,9 @@ def render_artistic_nib(canvas, point, angle=45, nib_size=6, color=(20, 20, 20))
 def render_frame(original_img, clean_bg, components, global_progress, show_nib=True):
     canvas = clean_bg.copy()
     num_comp = len(components)
-    
     active_nib_point = None
 
     for idx, comp in enumerate(components):
-        # Stagger component start and end times
         start_t = idx / float(num_comp)
         end_t = (idx + 1) / float(num_comp)
 
@@ -231,7 +225,6 @@ def render_frame(original_img, clean_bg, components, global_progress, show_nib=T
         mask = comp["mask"]
         progress_map = comp["progress_map"]
         
-        # Soft-feathered stroke reveal
         reveal_threshold = local_progress + 0.02
         active_pixels = mask & (progress_map <= reveal_threshold)
         canvas[active_pixels] = original_img[active_pixels]
@@ -264,61 +257,98 @@ def build_gif(frames, duration=50):
 # STREAMLIT INTERFACE
 # ============================================================
 
-uploaded_file = st.file_uploader("Upload Calligraphy Image", type=["jpg", "jpeg", "png", "webp"])
+uploaded_files = st.file_uploader(
+    "Upload Calligraphy Images (Multiple Selection Supported)",
+    type=["jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True
+)
 
-st.sidebar.header("🎨 Writing Settings")
+st.sidebar.header("🎨 Global Writing Settings")
 canvas_style = st.sidebar.selectbox("Background Style", ["Pure White Canvas", "Cleaned Paper Texture", "Original Image"])
 writing_direction = st.sidebar.selectbox("Default Writing Direction", ["Left -> Right", "Top -> Bottom", "Right -> Left"])
 show_nib = st.sidebar.checkbox("Show Calligraphy Pen Tip", value=True)
-total_frames = st.sidebar.slider("Total Frames", 30, 180, 75, step=5)
+total_frames = st.sidebar.slider("Total Frames per GIF", 30, 180, 75, step=5)
 gif_speed = st.sidebar.slider("Frame Delay (ms)", 20, 100, 40, step=5)
 
-if uploaded_file:
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+if uploaded_files:
+    st.info(f"📁 {len(uploaded_files)} file(s) uploaded. Review pre-processed masks below or generate batch animations directly.")
 
-    if image is not None:
-        norm_img, binary_mask = preprocess_and_clean_background(image)
-        components = extract_stroke_components(binary_mask)
+    tabs = st.tabs([f"🖼️ {file.name}" for file in uploaded_files])
+    processed_data = {}
 
-        for comp in components:
-            path, p_map = prepare_stroke_progress_map(comp, writing_direction)
-            comp["path"] = path
-            comp["progress_map"] = p_map
+    for tab, file in zip(tabs, uploaded_files):
+        with tab:
+            file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-        if canvas_style == "Pure White Canvas":
-            base_bg = np.full_like(image, 255, dtype=np.uint8)
-        elif canvas_style == "Cleaned Paper Texture":
-            base_bg = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR)
-        else:
-            base_bg = image.copy()
+            if image is None:
+                st.error("Invalid image file format.")
+                continue
 
-        st.subheader("Preview & Generation")
-        col1, col2 = st.columns(2)
+            norm_img, binary_mask = preprocess_and_clean_background(image)
+            components = extract_stroke_components(binary_mask)
 
-        with col1:
-            st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Uploaded Image", use_container_width=True)
+            for comp in components:
+                path, p_map = prepare_stroke_progress_map(comp, writing_direction)
+                comp["path"] = path
+                comp["progress_map"] = p_map
 
-        with col2:
-            st.image(binary_mask, caption=f"Extracted Clean Strokes ({len(components)} stroke components)", use_container_width=True)
+            if canvas_style == "Pure White Canvas":
+                base_bg = np.full_like(image, 255, dtype=np.uint8)
+            elif canvas_style == "Cleaned Paper Texture":
+                base_bg = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR)
+            else:
+                base_bg = image.copy()
 
-        if st.button("✨ Generate Calligraphy Animation", type="primary"):
-            progress_bar = st.progress(0)
-            frames = []
+            col1, col2 = st.columns(2)
+            with col1:
+                st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Uploaded Image", use_container_width=True)
+            with col2:
+                st.image(binary_mask, caption=f"Extracted Clean Strokes ({len(components)} strokes)", use_container_width=True)
 
-            for f_idx in range(total_frames):
-                g_progress = f_idx / float(max(1, total_frames - 1))
-                frame = render_frame(image, base_bg, components, g_progress, show_nib=show_nib)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(rgb_frame))
-                progress_bar.progress((f_idx + 1) / total_frames)
+            processed_data[file.name] = {
+                "image": image,
+                "base_bg": base_bg,
+                "components": components
+            }
 
-            gif_data = build_gif(frames, duration=gif_speed)
-            st.image(gif_data, caption="Artistic Writing Animation", use_container_width=True)
+    st.markdown("---")
 
-            st.download_button(
-                "📥 Download GIF Animation",
-                data=gif_data,
-                file_name="artistic_calligraphy.gif",
-                mime="image/gif"
-            )
+    if st.button("🚀 Render All Animations & Download ZIP", type="primary"):
+        batch_progress = st.progress(0)
+        status_text = st.empty()
+        zip_buffer = io.BytesIO()
+
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for idx, file in enumerate(uploaded_files):
+                if file.name not in processed_data:
+                    continue
+
+                status_text.write(f"Rendering ({idx + 1}/{len(uploaded_files)}): **{file.name}**...")
+                item = processed_data[file.name]
+
+                frames = []
+                for f_idx in range(total_frames):
+                    g_progress = f_idx / float(max(1, total_frames - 1))
+                    frame = render_frame(item["image"], item["base_bg"], item["components"], g_progress, show_nib=show_nib)
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frames.append(Image.fromarray(rgb_frame))
+
+                gif_bytes = build_gif(frames, duration=gif_speed)
+                
+                if gif_bytes:
+                    clean_name = file.name.rsplit('.', 1)[0]
+                    zip_file.writestr(f"animated_{clean_name}.gif", gif_bytes)
+
+                batch_progress.progress((idx + 1) / len(uploaded_files))
+
+        status_text.success("🎉 All animations rendered successfully!")
+        batch_progress.empty()
+
+        zip_buffer.seek(0)
+        st.download_button(
+            "📦 Download All Animations (.ZIP Folder)",
+            data=zip_buffer.getvalue(),
+            file_name="calligraphy_animations.zip",
+            mime="application/zip"
+        )
