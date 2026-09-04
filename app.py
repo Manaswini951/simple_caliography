@@ -1,131 +1,365 @@
-import streamlit as st
+import io
+import math
+import zipfile
+from collections import deque
 import cv2
 import numpy as np
-import tempfile
-import imageio.v2 as imageio
+import streamlit as st
+from PIL import Image
 
-st.set_page_config(page_title="Calligraphy Stroke Animator", layout="centered")
-st.title("🖋️ Calligraphy Stroke Animator")
-st.write("Upload your calligraphy photo to extract the strokes, animate them being drawn on a clean white canvas, and reveal enhanced colors.")
+# ============================================================
+# PAGE SETUP
+# ============================================================
+st.set_page_config(
+    page_title="Smooth Calligraphy Flow Animator",
+    page_icon="✒️",
+    layout="wide",
+)
 
-uploaded_file = st.file_uploader("Choose a calligraphy image...", type=["jpg", "jpeg", "png"])
+st.title("✒️ Smooth Calligraphy Flow & Glow Animator")
+st.caption("Draws smooth strokes on a pure white canvas, enhances color vibrancy with soft glow, and finally blends seamlessly into the original captured photo.")
 
-def clean_and_extract_strokes(bgr_img):
+# ============================================================
+# EXTRACTION & NOISE SUPPRESSION
+# ============================================================
+
+def clean_and_extract_elements(bgr_img):
+    """
+    Suppresses uneven lighting, shadows, and borders to isolate pure strokes.
+    """
     h, w = bgr_img.shape[:2]
     gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
 
-    # Background illumination correction
+    # 1. Background illumination modeling
     kernel_bg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51))
     bg = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel_bg)
     diff = cv2.absdiff(bg, gray)
     norm = cv2.normalize(diff, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
 
-    # Otsu thresholding on normalized ink
-    _, stroke_mask = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 2. Extract ink mask
+    _, binary = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Clean up small noise and edge border artifacts
+    # 3. Clean up edge artifacts and border vignette shadows
     kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    stroke_mask = cv2.morphologyEx(stroke_mask, cv2.MORPH_OPEN, kernel_clean)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean)
 
-    border = 15
-    stroke_mask[:border, :] = 0
-    stroke_mask[-border:, :] = 0
-    stroke_mask[:, :border] = 0
-    stroke_mask[:, -border:] = 0
+    border = max(10, int(min(h, w) * 0.02))
+    binary[:border, :] = 0
+    binary[-border:, :] = 0
+    binary[:, :border] = 0
+    binary[:, -border:] = 0
 
-    # Filter connected components by minimum area
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(stroke_mask, connectivity=8)
-    min_stroke_area = (h * w) * 0.001
-    clean_mask = np.zeros_like(stroke_mask)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= min_stroke_area:
-            clean_mask[labels == i] = 255
+    # 4. Filter connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    min_area = max(50, int(h * w * 0.001))
 
-    # Boost color vibrancy & lighting
+    components = []
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < min_area:
+            continue
+
+        comp_mask = (labels == label).astype(np.uint8) * 255
+        x = stats[label, cv2.CC_STAT_LEFT]
+        y = stats[label, cv2.CC_STAT_TOP]
+        cw = stats[label, cv2.CC_STAT_WIDTH]
+        ch = stats[label, cv2.CC_STAT_HEIGHT]
+
+        # Extract representative color (median of ink pixels)
+        ink_pixels = bgr_img[comp_mask > 0]
+        comp_bgr = np.median(ink_pixels, axis=0).astype(np.uint8)
+
+        components.append({
+            "id": len(components) + 1,
+            "mask": comp_mask,
+            "bbox": (x, y, x + cw, y + ch),
+            "center": (centroids[label][0], centroids[label][1]),
+            "area": area,
+            "color": comp_bgr
+        })
+
+    # Sort left-to-right to mimic standard natural writing order
+    components.sort(key=lambda c: c["bbox"][0])
+    return components, binary
+
+def compute_geodesic_progress_map(comp_mask, direction="Top -> Bottom"):
+    """
+    Generates a continuous progress gradient (0.0 to 1.0) along the stroke
+    using geodesic distance propagation (BFS on pixel grid).
+    """
+    ys, xs = np.where(comp_mask > 0)
+    if len(xs) == 0:
+        return np.zeros_like(comp_mask, dtype=np.float32), []
+
+    points = np.column_stack((ys, xs))
+    if direction == "Top -> Bottom":
+        start_idx = np.argmin(points[:, 0])
+    elif direction == "Bottom -> Top":
+        start_idx = np.argmax(points[:, 0])
+    elif direction == "Left -> Right":
+        start_idx = np.argmin(points[:, 1])
+    else:  # Right -> Left
+        start_idx = np.argmax(points[:, 1])
+
+    start_pt = tuple(points[start_idx])
+
+    h, w = comp_mask.shape
+    dist_map = np.full((h, w), np.inf, dtype=np.float32)
+    dist_map[start_pt] = 0.0
+
+    queue = deque([start_pt])
+    max_d = 0.0
+
+    neighbors = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+                 (-1, -1, 1.414), (-1, 1, 1.414), (1, -1, 1.414), (1, 1, 1.414)]
+
+    while queue:
+        cy, cx = queue.popleft()
+        cd = dist_map[cy, cx]
+
+        for dy, dx, weight in neighbors:
+            ny, nx = cy + dy, cx + dx
+            if 0 <= ny < h and 0 <= nx < w and comp_mask[ny, nx] > 0:
+                if cd + weight < dist_map[ny, nx]:
+                    dist_map[ny, nx] = cd + weight
+                    max_d = max(max_d, cd + weight)
+                    queue.append((ny, nx))
+
+    progress_map = np.zeros((h, w), dtype=np.float32)
+    valid = comp_mask > 0
+    if max_d > 0:
+        progress_map[valid] = dist_map[valid] / max_d
+
+    # Sample trajectory points for pen tip tracking
+    sampled_path = []
+    num_steps = 100
+    for s in range(num_steps):
+        target = s / float(num_steps - 1)
+        sub_pts = points[np.abs(progress_map[points[:, 0], points[:, 1]] - target) < 0.05]
+        if len(sub_pts) > 0:
+            sampled_path.append((int(np.mean(sub_pts[:, 0])), int(np.mean(sub_pts[:, 1]))))
+        elif sampled_path:
+            sampled_path.append(sampled_path[-1])
+
+    return progress_map, sampled_path
+
+def enhance_vibrancy(bgr_img):
+    """
+    Enhances hue saturation and lighting contrast of the artwork.
+    """
     hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.45, 0, 255)
-    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.15, 0, 255)
-    enhanced_bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.45, 0, 255)  # Saturation
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.15, 0, 255)  # Luminance
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-    return clean_mask, enhanced_bgr
+# ============================================================
+# RENDERING PIPELINE
+# ============================================================
 
-def build_animation(bgr_img, stroke_mask, enhanced_bgr, total_draw_frames=45, glow_frames=15):
-    h, w = stroke_mask.shape
-    coords = np.argwhere(stroke_mask > 0)
-    if len(coords) == 0:
-        return []
+def render_frame(
+    original_bgr, enhanced_bgr, components, frame_idx, total_frames,
+    write_ratio=0.65, glow_intensity=0.3, show_pen=True,
+    enable_original_merge=True, merge_percent=20
+):
+    h, w = original_bgr.shape[:2]
+    canvas = np.full((h, w, 3), 255, dtype=np.uint8)
 
-    diag_scores = coords[:, 0] * 0.6 + coords[:, 1] * 0.4
-    sorted_order = np.argsort(diag_scores)
-    sorted_coords = coords[sorted_order]
+    t_global = frame_idx / float(max(1, total_frames - 1))
+    write_phase_end = write_ratio
 
-    frames = []
+    merge_phase_start = 1.0 - (merge_percent / 100.0) if enable_original_merge else 1.0
+    active_pen_point = None
 
-    # Phase 1: Progressive drawing on white canvas
-    chunk_size = int(np.ceil(len(sorted_coords) / total_draw_frames))
-    canvas_mask = np.zeros((h, w), dtype=np.uint8)
+    # --- Phase 1: Progressive Calligraphy Drawing ---
+    t_write = min(1.0, t_global / write_phase_end)
+    num_comps = len(components)
 
-    for f in range(total_draw_frames):
-        idx_end = min((f + 1) * chunk_size, len(sorted_coords))
-        new_pts = sorted_coords[f * chunk_size:idx_end]
-        if len(new_pts) > 0:
-            canvas_mask[new_pts[:, 0], new_pts[:, 1]] = 255
+    for i, comp in enumerate(components):
+        comp_start = i / float(num_comps)
+        comp_end = (i + 1) / float(num_comps)
 
-        soft_mask = cv2.GaussianBlur(canvas_mask, (5, 5), 0) / 255.0
-        frame_rgb = np.zeros((h, w, 3), dtype=np.float32)
+        if t_write < comp_start:
+            continue
 
+        comp_t = (t_write - comp_start) / (comp_end - comp_start)
+        comp_t = max(0.0, min(1.0, comp_t))
+
+        # Smooth cubic ease
+        smooth_t = comp_t * comp_t * (3.0 - 2.0 * comp_t)
+
+        pmap = comp["progress_map"]
+        mask = comp["mask"]
+        visible = mask & (pmap <= smooth_t + 0.03)
+
+        edge_soft = cv2.GaussianBlur(visible.astype(np.uint8) * 255, (5, 5), 0) / 255.0
         for c in range(3):
-            stroke_ch = enhanced_bgr[:, :, 2 - c].astype(np.float32)
-            frame_rgb[:, :, c] = 255.0 * (1.0 - soft_mask) + stroke_ch * soft_mask
+            canvas[:, :, c] = np.clip(
+                canvas[:, :, c] * (1.0 - edge_soft) + enhanced_bgr[:, :, c] * edge_soft,
+                0, 255
+            ).astype(np.uint8)
 
-        frames.append(np.clip(frame_rgb, 0, 255).astype(np.uint8))
+        if show_pen and 0.0 < comp_t < 1.0 and comp["path"]:
+            p_idx = min(int(smooth_t * (len(comp["path"]) - 1)), len(comp["path"]) - 1)
+            active_pen_point = comp["path"][p_idx]
 
-    # Phase 2: Color glow & brightening
-    final_draw = frames[-1].copy()
-    soft_full_mask = cv2.GaussianBlur(stroke_mask, (7, 7), 0) / 255.0
-    glow_mask = cv2.GaussianBlur(stroke_mask, (25, 25), 0) / 255.0
+    # --- Phase 2: Color Glow & Lightening ---
+    if t_global > write_phase_end:
+        glow_end = merge_phase_start if enable_original_merge else 1.0
+        t_glow = min(1.0, (t_global - write_phase_end) / max(0.001, (glow_end - write_phase_end)))
+        t_glow = t_glow * t_glow * (3.0 - 2.0 * t_glow)
 
-    for f in range(glow_frames):
-        alpha = (f + 1) / glow_frames
-        blended = final_draw.astype(np.float32)
+        combined_mask = np.zeros((h, w), dtype=np.uint8)
+        for comp in components:
+            combined_mask = cv2.bitwise_or(combined_mask, comp["mask"])
 
-        for c in range(3):
-            orig_ch = enhanced_bgr[:, :, 2 - c].astype(np.float32)
-            bloom = cv2.GaussianBlur(orig_ch, (21, 21), 0)
-            glow_layer = orig_ch * (1.0 - 0.25 * alpha) + bloom * (0.25 * alpha)
+        blur_k = max(15, (min(h, w) // 30) | 1)
+        glow_bloom = cv2.GaussianBlur(enhanced_bgr, (blur_k, blur_k), 0).astype(np.float32)
 
-            blended[:, :, c] = (
-                255.0 * (1.0 - soft_full_mask)
-                + (glow_layer * soft_full_mask) * (1.0 + 0.15 * alpha * glow_mask)
-            )
+        stroke_alpha = cv2.GaussianBlur(combined_mask, (7, 7), 0) / 255.0
+        stroke_alpha = np.repeat(stroke_alpha[:, :, np.newaxis], 3, axis=2)
 
-        frames.append(np.clip(blended, 0, 255).astype(np.uint8))
+        bloomed = np.clip(
+            enhanced_bgr.astype(np.float32) * (1.0 + glow_intensity * t_glow) +
+            glow_bloom * (t_glow * 0.25),
+            0, 255
+        )
 
-    for _ in range(10):
-        frames.append(frames[-1])
+        canvas = np.clip(
+            canvas.astype(np.float32) * (1.0 - stroke_alpha * t_glow) +
+            bloomed * (stroke_alpha * t_glow),
+            0, 255
+        ).astype(np.uint8)
 
-    return frames
+    # --- Pen Nib Indicator ---
+    if show_pen and active_pen_point is not None and t_global <= write_phase_end:
+        py, px = active_pen_point
+        cv2.circle(canvas, (px, py), 4, (30, 30, 30), -1, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, (px - 1, py - 1), 2, (230, 230, 230), -1, lineType=cv2.LINE_AA)
 
-if uploaded_file is not None:
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    # --- Phase 3: Smooth Merge into Original Image ---
+    if enable_original_merge and t_global >= merge_phase_start:
+        alpha = (t_global - merge_phase_start) / max(0.001, (1.0 - merge_phase_start))
+        alpha = max(0.0, min(1.0, alpha))
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # Smooth cubic blend
+        canvas = cv2.addWeighted(canvas, 1.0 - alpha, original_bgr, alpha, 0)
 
-    # Downscale and ensure even dimensions for MP4 encoding
-    max_dim = 900
-    h, w = image_bgr.shape[:2]
-    scale = min(1.0, max_dim / float(max(h, w)))
-    new_w = int(w * scale) // 2 * 2
-    new_h = int(h * scale) // 2 * 2
-    image_bgr = cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return canvas
 
-    with st.spinner("Extracting calligraphy strokes and rendering video..."):
-        mask, enhanced_bgr = clean_and_extract_strokes(image_bgr)
-        frames = build_animation(image_bgr, mask, enhanced_bgr)
+def build_gif(frames, duration_ms=50):
+    if not frames:
+        return b""
+    pil_frames = [f.convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=256) for f in frames]
+    buf = io.BytesIO()
+    pil_frames[0].save(
+        buf, format="GIF", save_all=True, append_images=pil_frames[1:],
+        duration=duration_ms, loop=0, optimize=False
+    )
+    return buf.getvalue()
 
-    if frames:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
-            imageio.mimsave(tmp_file.name, frames, fps=24)
-            st.success("Animation complete!")
-            st.video(tmp_file.name)
-    else:
-        st.error("No calligraphy strokes detected. Try adjusting lighting or contrast.")
+# ============================================================
+# UI & CONTROLS
+# ============================================================
+
+st.sidebar.header("⚙️ Flow & Merge Settings")
+write_speed = st.sidebar.slider("Writing Phase Share (%)", 40, 80, 60, help="Time spent drawing letters.")
+glow_power = st.sidebar.slider("Color Lightening & Glow", 0.0, 0.6, 0.3, step=0.05)
+
+enable_merge = st.sidebar.checkbox("Merge Back into Original Photo at End", value=True)
+merge_duration = st.sidebar.slider("Original Photo Fade-In (%)", 5, 40, 20) if enable_merge else 0
+
+total_frames = st.sidebar.slider("Total Frames", 30, 150, 65, step=5)
+frame_duration = st.sidebar.slider("Frame Duration (ms)", 20, 100, 45, step=5)
+show_pen = st.sidebar.checkbox("Show Brush Nib Tip", value=True)
+
+uploaded_files = st.file_uploader(
+    "Upload Calligraphy Images",
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True
+)
+
+if uploaded_files:
+    st.info(f"Loaded {len(uploaded_files)} image(s). Configure directions or click Render below.")
+    tabs = st.tabs([f"📄 {f.name}" for f in uploaded_files])
+
+    cached_data = {}
+
+    for tab, file in zip(tabs, uploaded_files):
+        with tab:
+            file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+            # Resize if overly large for fast rendering
+            max_size = 900
+            h, w = img.shape[:2]
+            if max(h, w) > max_size:
+                scale = max_size / float(max(h, w))
+                img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+            components, clean_mask = clean_and_extract_elements(img)
+            enhanced = enhance_vibrancy(img)
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.subheader("Cleaned Ink Isolation")
+                st.image(cv2.cvtColor(clean_mask, cv2.COLOR_GRAY2RGB), caption="Extracted strokes without paper borders", use_container_width=True)
+
+            with c2:
+                st.subheader("Stroke Configurations")
+                for i, comp in enumerate(components):
+                    col_dir = st.selectbox(
+                        f"Stroke {i+1} Writing Direction",
+                        ["Top -> Bottom", "Left -> Right", "Bottom -> Top", "Right -> Left"],
+                        index=0,
+                        key=f"dir_{file.name}_{i}"
+                    )
+                    pmap, path = compute_geodesic_progress_map(comp["mask"], col_dir)
+                    comp["progress_map"] = pmap
+                    comp["path"] = path
+
+            cached_data[file.name] = {
+                "original": img,
+                "enhanced": enhanced,
+                "components": components
+            }
+
+    st.markdown("---")
+    if st.button("🚀 Render All Smooth Animations (.ZIP)", type="primary"):
+        prog = st.progress(0)
+        status = st.empty()
+        zip_buf = io.BytesIO()
+
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for idx, file in enumerate(uploaded_files):
+                status.write(f"Animating ({idx + 1}/{len(uploaded_files)}): **{file.name}**...")
+                item = cached_data[file.name]
+
+                frames = []
+                for f_idx in range(total_frames):
+                    rendered = render_frame(
+                        item["original"],
+                        item["enhanced"],
+                        item["components"],
+                        f_idx,
+                        total_frames,
+                        write_ratio=write_speed / 100.0,
+                        glow_intensity=glow_power,
+                        show_pen=show_pen,
+                        enable_original_merge=enable_merge,
+                        merge_percent=merge_duration
+                    )
+                    frames.append(Image.fromarray(cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)))
+
+                gif_bytes = build_gif(frames, duration_ms=frame_duration)
+                zf.writestr(f"animated_{file.name.rsplit('.', 1)[0]}.gif", gif_bytes)
+                prog.progress((idx + 1) / len(uploaded_files))
+
+        status.success("All calligraphy animations generated successfully!")
+        prog.empty()
+
+        zip_buf.seek(0)
+        st.download_button(
+            "📦 Download Smooth Animated GIFs (.ZIP)",
+            data=zip_buf.getvalue(),
+            file_name="calligraphy_smooth_animations.zip",
+            mime="application/zip"
+        )
