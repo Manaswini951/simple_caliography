@@ -1,9 +1,8 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
 import tempfile
-import imageio
+import imageio.v2 as imageio
 
 st.set_page_config(page_title="Calligraphy Stroke Animator", layout="centered")
 st.title("🖋️ Calligraphy Stroke Animator")
@@ -12,23 +11,19 @@ st.write("Upload your calligraphy photo to extract the strokes, animate them bei
 uploaded_file = st.file_uploader("Choose a calligraphy image...", type=["jpg", "jpeg", "png"])
 
 def clean_and_extract_strokes(bgr_img):
-    """
-    Normalizes uneven paper lighting, removes shadow borders,
-    and returns a binary mask of clean strokes alongside enhanced color.
-    """
     h, w = bgr_img.shape[:2]
     gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
 
-    # 1. Background illumination correction
+    # Background illumination correction
     kernel_bg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51))
     bg = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel_bg)
     diff = cv2.absdiff(bg, gray)
     norm = cv2.normalize(diff, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
 
-    # 2. Otsu thresholding on the normalized ink
+    # Otsu thresholding on normalized ink
     _, stroke_mask = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 3. Clean up noise and suppress border shadows
+    # Clean up small noise and edge border artifacts
     kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     stroke_mask = cv2.morphologyEx(stroke_mask, cv2.MORPH_OPEN, kernel_clean)
 
@@ -38,7 +33,7 @@ def clean_and_extract_strokes(bgr_img):
     stroke_mask[:, :border] = 0
     stroke_mask[:, -border:] = 0
 
-    # 4. Filter small noise fragments
+    # Filter connected components by minimum area
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(stroke_mask, connectivity=8)
     min_stroke_area = (h * w) * 0.001
     clean_mask = np.zeros_like(stroke_mask)
@@ -46,34 +41,27 @@ def clean_and_extract_strokes(bgr_img):
         if stats[i, cv2.CC_STAT_AREA] >= min_stroke_area:
             clean_mask[labels == i] = 255
 
-    # 5. Boost color vibrancy & lighting
+    # Boost color vibrancy & lighting
     hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.45, 0, 255)  # Saturation boost
-    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.15, 0, 255)  # Lightness boost
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.45, 0, 255)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.15, 0, 255)
     enhanced_bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
     return clean_mask, enhanced_bgr
 
 def build_animation(bgr_img, stroke_mask, enhanced_bgr, total_draw_frames=45, glow_frames=15):
-    """
-    Generates frames:
-    - Phase 1: Progressive sweep simulating natural drawing on pure white.
-    - Phase 2: Vibrant colors fade in with soft glow effects.
-    """
     h, w = stroke_mask.shape
     coords = np.argwhere(stroke_mask > 0)
     if len(coords) == 0:
         return []
 
-    # Map drawing trajectory across primary diagonal
     diag_scores = coords[:, 0] * 0.6 + coords[:, 1] * 0.4
     sorted_order = np.argsort(diag_scores)
     sorted_coords = coords[sorted_order]
 
-    pure_white = np.full((h, w, 3), 255, dtype=np.uint8)
     frames = []
 
-    # --- Phase 1: Drawing on White Canvas ---
+    # Phase 1: Progressive drawing on white canvas
     chunk_size = int(np.ceil(len(sorted_coords) / total_draw_frames))
     canvas_mask = np.zeros((h, w), dtype=np.uint8)
 
@@ -83,21 +71,18 @@ def build_animation(bgr_img, stroke_mask, enhanced_bgr, total_draw_frames=45, gl
         if len(new_pts) > 0:
             canvas_mask[new_pts[:, 0], new_pts[:, 1]] = 255
 
-        # Antialias drawing edges
         soft_mask = cv2.GaussianBlur(canvas_mask, (5, 5), 0) / 255.0
         frame_rgb = np.zeros((h, w, 3), dtype=np.float32)
 
         for c in range(3):
-            # Render strokes using enhanced BGR colors
             stroke_ch = enhanced_bgr[:, :, 2 - c].astype(np.float32)
             frame_rgb[:, :, c] = 255.0 * (1.0 - soft_mask) + stroke_ch * soft_mask
 
         frames.append(np.clip(frame_rgb, 0, 255).astype(np.uint8))
 
-    # --- Phase 2: Color Glow & Lightening ---
+    # Phase 2: Color glow & brightening
     final_draw = frames[-1].copy()
     soft_full_mask = cv2.GaussianBlur(stroke_mask, (7, 7), 0) / 255.0
-
     glow_mask = cv2.GaussianBlur(stroke_mask, (25, 25), 0) / 255.0
 
     for f in range(glow_frames):
@@ -106,18 +91,16 @@ def build_animation(bgr_img, stroke_mask, enhanced_bgr, total_draw_frames=45, gl
 
         for c in range(3):
             orig_ch = enhanced_bgr[:, :, 2 - c].astype(np.float32)
-            # Subtle radial bloom / brightening
             bloom = cv2.GaussianBlur(orig_ch, (21, 21), 0)
             glow_layer = orig_ch * (1.0 - 0.25 * alpha) + bloom * (0.25 * alpha)
-            
+
             blended[:, :, c] = (
-                255.0 * (1.0 - soft_full_mask) 
+                255.0 * (1.0 - soft_full_mask)
                 + (glow_layer * soft_full_mask) * (1.0 + 0.15 * alpha * glow_mask)
             )
 
         frames.append(np.clip(blended, 0, 255).astype(np.uint8))
 
-    # Hold final frame
     for _ in range(10):
         frames.append(frames[-1])
 
@@ -127,18 +110,22 @@ if uploaded_file is not None:
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-    # Downscale high-res uploads to maintain smooth playback performance
+    # Downscale and ensure even dimensions for MP4 encoding
     max_dim = 900
     h, w = image_bgr.shape[:2]
-    if max(h, w) > max_dim:
-        scale = max_dim / float(max(h, w))
-        image_bgr = cv2.resize(image_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    scale = min(1.0, max_dim / float(max(h, w)))
+    new_w = int(w * scale) // 2 * 2
+    new_h = int(h * scale) // 2 * 2
+    image_bgr = cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    with st.spinner("Removing background shadows and extracting strokes..."):
+    with st.spinner("Extracting calligraphy strokes and rendering video..."):
         mask, enhanced_bgr = clean_and_extract_strokes(image_bgr)
         frames = build_animation(image_bgr, mask, enhanced_bgr)
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
-        imageio.mimsave(tmp_file.name, frames, fps=24, format="mp4")
-        st.success("Animation complete!")
-        st.video(tmp_file.name)
+    if frames:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
+            imageio.mimsave(tmp_file.name, frames, fps=24)
+            st.success("Animation complete!")
+            st.video(tmp_file.name)
+    else:
+        st.error("No calligraphy strokes detected. Try adjusting lighting or contrast.")
