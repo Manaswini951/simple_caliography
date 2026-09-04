@@ -8,16 +8,19 @@ import streamlit as st
 from PIL import Image
 
 # ============================================================
-# PAGE SETUP
+# PAGE CONFIGURATION
 # ============================================================
 st.set_page_config(
-    page_title="Smooth Calligraphy Flow Animator",
+    page_title="Smooth Calligraphy Flow & Merge Animator",
     page_icon="✒️",
     layout="wide",
 )
 
-st.title("✒️ Smooth Calligraphy Flow & Glow Animator")
-st.caption("Draws smooth strokes on a pure white canvas, enhances color vibrancy with soft glow, and finally blends seamlessly into the original captured photo.")
+st.title("✒️ Smooth Calligraphy Flow & Merge Animator")
+st.caption(
+    "Upload multiple images. Smoothly traces strokes on a pure white canvas, "
+    "blooms into vibrant ink, seamlessly merges into the original photograph, and holds it visibly before looping."
+)
 
 # ============================================================
 # EXTRACTION & NOISE SUPPRESSION
@@ -39,7 +42,7 @@ def clean_and_extract_elements(bgr_img):
     # 2. Extract ink mask
     _, binary = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 3. Clean up edge artifacts and border vignette shadows
+    # 3. Clean up edge artifacts and border shadows
     kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean)
 
@@ -65,7 +68,6 @@ def clean_and_extract_elements(bgr_img):
         cw = stats[label, cv2.CC_STAT_WIDTH]
         ch = stats[label, cv2.CC_STAT_HEIGHT]
 
-        # Extract representative color (median of ink pixels)
         ink_pixels = bgr_img[comp_mask > 0]
         comp_bgr = np.median(ink_pixels, axis=0).astype(np.uint8)
 
@@ -158,7 +160,7 @@ def enhance_vibrancy(bgr_img):
 
 def render_frame(
     original_bgr, enhanced_bgr, components, frame_idx, total_frames,
-    write_ratio=0.65, glow_intensity=0.3, show_pen=True,
+    write_ratio=0.60, glow_intensity=0.3, show_pen=True,
     enable_original_merge=True, merge_percent=20
 ):
     h, w = original_bgr.shape[:2]
@@ -184,7 +186,6 @@ def render_frame(
         comp_t = (t_write - comp_start) / (comp_end - comp_start)
         comp_t = max(0.0, min(1.0, comp_t))
 
-        # Smooth cubic ease
         smooth_t = comp_t * comp_t * (3.0 - 2.0 * comp_t)
 
         pmap = comp["progress_map"]
@@ -240,7 +241,7 @@ def render_frame(
     if enable_original_merge and t_global >= merge_phase_start:
         alpha = (t_global - merge_phase_start) / max(0.001, (1.0 - merge_phase_start))
         alpha = max(0.0, min(1.0, alpha))
-        alpha = alpha * alpha * (3.0 - 2.0 * alpha)  # Smooth cubic blend
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
         canvas = cv2.addWeighted(canvas, 1.0 - alpha, original_bgr, alpha, 0)
 
     return canvas
@@ -257,28 +258,36 @@ def build_gif(frames, duration_ms=50):
     return buf.getvalue()
 
 # ============================================================
-# UI & CONTROLS
+# SIDEBAR CONTROLS
 # ============================================================
 
 st.sidebar.header("⚙️ Flow & Merge Settings")
-write_speed = st.sidebar.slider("Writing Phase Share (%)", 40, 80, 60, help="Time spent drawing letters.")
+write_speed = st.sidebar.slider("Writing Phase Share (%)", 30, 80, 55, help="Time spent drawing strokes before color bloom.")
 glow_power = st.sidebar.slider("Color Lightening & Glow", 0.0, 0.6, 0.3, step=0.05)
 
 enable_merge = st.sidebar.checkbox("Merge Back into Original Photo at End", value=True)
-merge_duration = st.sidebar.slider("Original Photo Fade-In (%)", 5, 40, 20) if enable_merge else 0
+merge_duration = st.sidebar.slider("Transition Duration (%)", 5, 40, 20) if enable_merge else 0
 
-total_frames = st.sidebar.slider("Total Frames", 30, 150, 65, step=5)
-frame_duration = st.sidebar.slider("Frame Duration (ms)", 20, 100, 45, step=5)
+st.sidebar.markdown("---")
+st.sidebar.subheader("⏱️ Timing & Hold Settings")
+total_animated_frames = st.sidebar.slider("Animation Transition Frames", 30, 120, 60, step=5)
+frame_duration = st.sidebar.slider("Frame Delay (ms)", 20, 100, 45, step=5)
+hold_seconds = st.sidebar.slider("Original Image Hold Duration (seconds)", 0.5, 4.0, 2.0, step=0.5,
+                                help="How long the complete original image stays visible before restarting.")
 show_pen = st.sidebar.checkbox("Show Brush Nib Tip", value=True)
 
+# ============================================================
+# MAIN APPLICATION
+# ============================================================
+
 uploaded_files = st.file_uploader(
-    "Upload Calligraphy Images",
+    "Upload Calligraphy Images (Select multiple files at once)",
     type=["jpg", "jpeg", "png"],
     accept_multiple_files=True
 )
 
 if uploaded_files:
-    st.info(f"Loaded {len(uploaded_files)} image(s). Configure directions or click Render below.")
+    st.info(f"Loaded **{len(uploaded_files)}** image(s). Customize stroke directions or render animations below.")
     tabs = st.tabs([f"📄 {f.name}" for f in uploaded_files])
 
     cached_data = {}
@@ -288,7 +297,6 @@ if uploaded_files:
             file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
             img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-            # Resize if overly large for fast rendering
             max_size = 900
             h, w = img.shape[:2]
             if max(h, w) > max_size:
@@ -307,7 +315,7 @@ if uploaded_files:
                 st.subheader("Stroke Configurations")
                 for i, comp in enumerate(components):
                     col_dir = st.selectbox(
-                        f"Stroke {i+1} Writing Direction",
+                        f"Stroke {i+1} Direction",
                         ["Top -> Bottom", "Left -> Right", "Bottom -> Top", "Right -> Left"],
                         index=0,
                         key=f"dir_{file.name}_{i}"
@@ -328,19 +336,24 @@ if uploaded_files:
         status = st.empty()
         zip_buf = io.BytesIO()
 
+        # Calculate exact number of hold frames based on selected seconds and frame duration
+        hold_frames_count = int((hold_seconds * 1000) / frame_duration)
+
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for idx, file in enumerate(uploaded_files):
-                status.write(f"Animating ({idx + 1}/{len(uploaded_files)}): **{file.name}**...")
+                status.write(f"Rendering ({idx + 1}/{len(uploaded_files)}): **{file.name}**...")
                 item = cached_data[file.name]
 
                 frames = []
-                for f_idx in range(total_frames):
+
+                # Render dynamic drawing, blooming, and merge transition
+                for f_idx in range(total_animated_frames):
                     rendered = render_frame(
                         item["original"],
                         item["enhanced"],
                         item["components"],
                         f_idx,
-                        total_frames,
+                        total_animated_frames,
                         write_ratio=write_speed / 100.0,
                         glow_intensity=glow_power,
                         show_pen=show_pen,
@@ -349,11 +362,16 @@ if uploaded_files:
                     )
                     frames.append(Image.fromarray(cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)))
 
+                # Hold the final original image frame
+                final_frame = frames[-1]
+                for _ in range(hold_frames_count):
+                    frames.append(final_frame)
+
                 gif_bytes = build_gif(frames, duration_ms=frame_duration)
                 zf.writestr(f"animated_{file.name.rsplit('.', 1)[0]}.gif", gif_bytes)
                 prog.progress((idx + 1) / len(uploaded_files))
 
-        status.success("All calligraphy animations generated successfully!")
+        status.success("🎉 All animations generated successfully with end pause!")
         prog.empty()
 
         zip_buf.seek(0)
