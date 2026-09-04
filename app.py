@@ -26,24 +26,16 @@ st.write(
 # ============================================================
 
 def preprocess_and_clean_background(image):
-    """
-    Removes uneven paper textures and shadows using adaptive thresholding
-    and morphological opening, keeping only clean artwork ink.
-    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Estimate background lighting via large morphological dilation
     bg = cv2.dilate(gray, np.ones((19, 19), np.uint8))
     bg = cv2.medianBlur(bg, 21)
     
-    # Division normalization to flatten lighting variations
     diff = 255 - cv2.absdiff(gray, bg)
     norm = cv2.normalize(diff, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
     
-    # Binarize ink using Otsu's thresholding
     _, binary = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # Filter tiny isolated noise specs
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     cleaned_binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     
@@ -51,9 +43,6 @@ def preprocess_and_clean_background(image):
 
 
 def extract_stroke_components(binary_mask, min_area=80):
-    """
-    Extracts isolated stroke/letter components sorted left-to-right, top-to-bottom.
-    """
     num_labels, cc_labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
     components = []
 
@@ -76,7 +65,6 @@ def extract_stroke_components(binary_mask, min_area=80):
             "area": area,
         })
 
-    # Natural reading/writing order sorting (Top-to-Bottom, Left-to-Right)
     components.sort(key=lambda p: (p["bbox"][1] // 30, p["bbox"][0]))
     return components
 
@@ -110,7 +98,6 @@ def generate_ordered_path(skeleton, direction="Left -> Right"):
 
     points = list(zip(ys.astype(int), xs.astype(int)))
     
-    # Pick natural starting endpoint
     if direction == "Top -> Bottom":
         start = min(points, key=lambda p: p[0])
     elif direction == "Left -> Right":
@@ -120,7 +107,6 @@ def generate_ordered_path(skeleton, direction="Left -> Right"):
     else:
         start = max(points, key=lambda p: p[0])
 
-    # Greedy Nearest-Neighbor Path Traversal
     remaining = set(points)
     remaining.remove(start)
     path = [start]
@@ -131,7 +117,7 @@ def generate_ordered_path(skeleton, direction="Left -> Right"):
         nearest = min(remaining, key=lambda p: ((p[0] - cy) ** 2 + (p[1] - cx) ** 2))
         
         dist_sq = (nearest[0] - cy) ** 2 + (nearest[1] - cx) ** 2
-        if dist_sq > 2500:  # Gap threshold to separate distant strokes
+        if dist_sq > 2500:
             break
 
         path.append(nearest)
@@ -170,19 +156,26 @@ def prepare_stroke_progress_map(component, direction):
     h, w = component["mask"].shape
     ys, xs = np.where(component["mask"])
 
-    if len(xs) == 0 or not global_path:
-        progress_map = np.zeros((h, w), dtype=np.float32)
+    progress_map = np.zeros((h, w), dtype=np.float32)
+
+    if len(xs) == 0:
+        return global_path, progress_map
+
+    if len(global_path) <= 1:
         progress_map[component["mask"]] = 1.0
         return global_path, progress_map
 
     path_arr = np.array([[p[1], p[0]] for p in global_path], dtype=np.float32)
     pixel_points = np.column_stack((xs, ys)).astype(np.float32)
 
-    progress_map = np.zeros((h, w), dtype=np.float32)
-    distances = np.sqrt(((pixel_points[:, None, :] - path_arr[None, :, :]) ** 2).sum(axis=2))
-    nearest_indices = np.argmin(distances, axis=1)
+    # Chunked distance comparison to prevent memory allocation spikes
+    chunk_size = 2000
+    for i in range(0, len(pixel_points), chunk_size):
+        chunk = pixel_points[i:i + chunk_size]
+        dists = np.sqrt(((chunk[:, None, :] - path_arr[None, :, :]) ** 2).sum(axis=2))
+        nearest = np.argmin(dists, axis=1)
+        progress_map[ys[i:i + chunk_size], xs[i:i + chunk_size]] = nearest.astype(np.float32) / float(len(path_arr) - 1)
 
-    progress_map[ys, xs] = nearest_indices.astype(np.float32) / max(1, len(path_arr) - 1)
     return global_path, progress_map
 
 
@@ -210,6 +203,9 @@ def render_artistic_nib(canvas, point, angle=45, nib_size=6, color=(20, 20, 20))
 def render_frame(original_img, clean_bg, components, global_progress, show_nib=True):
     canvas = clean_bg.copy()
     num_comp = len(components)
+    if num_comp == 0:
+        return canvas
+
     active_nib_point = None
 
     for idx, comp in enumerate(components):
@@ -278,15 +274,20 @@ if uploaded_files:
 
     for tab, file in zip(tabs, uploaded_files):
         with tab:
+            file.seek(0)
             file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
             image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
             if image is None:
-                st.error("Invalid image file format.")
+                st.error(f"Could not read image file: {file.name}")
                 continue
 
             norm_img, binary_mask = preprocess_and_clean_background(image)
             components = extract_stroke_components(binary_mask)
+
+            if not components:
+                st.warning(f"No valid ink strokes detected in `{file.name}`. Try uploading an image with higher contrast.")
+                continue
 
             for comp in components:
                 path, p_map = prepare_stroke_progress_map(comp, writing_direction)
@@ -308,47 +309,50 @@ if uploaded_files:
 
             processed_data[file.name] = {
                 "image": image,
-                "base_bg": base_bg,
+                 base_bg": base_bg,
                 "components": components
             }
 
     st.markdown("---")
 
     if st.button("🚀 Render All Animations & Download ZIP", type="primary"):
-        batch_progress = st.progress(0)
-        status_text = st.empty()
-        zip_buffer = io.BytesIO()
+        if not processed_data:
+            st.error("No valid images available to render.")
+        else:
+            batch_progress = st.progress(0)
+            status_text = st.empty()
+            zip_buffer = io.BytesIO()
 
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            for idx, file in enumerate(uploaded_files):
-                if file.name not in processed_data:
-                    continue
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                for idx, file in enumerate(uploaded_files):
+                    if file.name not in processed_data:
+                        continue
 
-                status_text.write(f"Rendering ({idx + 1}/{len(uploaded_files)}): **{file.name}**...")
-                item = processed_data[file.name]
+                    status_text.write(f"Rendering ({idx + 1}/{len(uploaded_files)}): **{file.name}**...")
+                    item = processed_data[file.name]
 
-                frames = []
-                for f_idx in range(total_frames):
-                    g_progress = f_idx / float(max(1, total_frames - 1))
-                    frame = render_frame(item["image"], item["base_bg"], item["components"], g_progress, show_nib=show_nib)
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frames.append(Image.fromarray(rgb_frame))
+                    frames = []
+                    for f_idx in range(total_frames):
+                        g_progress = f_idx / float(max(1, total_frames - 1))
+                        frame = render_frame(item["image"], item["base_bg"], item["components"], g_progress, show_nib=show_nib)
+                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frames.append(Image.fromarray(rgb_frame))
 
-                gif_bytes = build_gif(frames, duration=gif_speed)
-                
-                if gif_bytes:
-                    clean_name = file.name.rsplit('.', 1)[0]
-                    zip_file.writestr(f"animated_{clean_name}.gif", gif_bytes)
+                    gif_bytes = build_gif(frames, duration=gif_speed)
+                    
+                    if gif_bytes:
+                        clean_name = file.name.rsplit('.', 1)[0]
+                        zip_file.writestr(f"animated_{clean_name}.gif", gif_bytes)
 
-                batch_progress.progress((idx + 1) / len(uploaded_files))
+                    batch_progress.progress((idx + 1) / len(uploaded_files))
 
-        status_text.success("🎉 All animations rendered successfully!")
-        batch_progress.empty()
+            status_text.success("🎉 All animations rendered successfully!")
+            batch_progress.empty()
 
-        zip_buffer.seek(0)
-        st.download_button(
-            "📦 Download All Animations (.ZIP Folder)",
-            data=zip_buffer.getvalue(),
-            file_name="calligraphy_animations.zip",
-            mime="application/zip"
-        )
+            zip_buffer.seek(0)
+            st.download_button(
+                "📦 Download All Animations (.ZIP Folder)",
+                data=zip_buffer.getvalue(),
+                file_name="calligraphy_animations.zip",
+                mime="application/zip"
+            )
