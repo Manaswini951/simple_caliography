@@ -25,6 +25,17 @@ st.write(
 # PREPROCESSING & SEGMENTATION
 # ============================================================
 
+def resize_if_large(img, max_dim=800):
+    """Downscales input image if it exceeds max dimensions to prevent memory crashes."""
+    h, w = img.shape[:2]
+    if max(h, w) <= max_dim:
+        return img
+    scale = max_dim / float(max(h, w))
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
 def preprocess_and_clean_background(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
@@ -42,7 +53,7 @@ def preprocess_and_clean_background(image):
     return norm, cleaned_binary
 
 
-def extract_stroke_components(binary_mask, min_area=80):
+def extract_stroke_components(binary_mask, min_area=60):
     num_labels, cc_labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
     components = []
 
@@ -70,7 +81,7 @@ def extract_stroke_components(binary_mask, min_area=80):
 
 
 # ============================================================
-# SKELETONIZATION & SMOOTH PATH GENERATION
+# SKELETONIZATION & PATH GENERATION
 # ============================================================
 
 def morphological_skeleton(binary):
@@ -168,12 +179,19 @@ def prepare_stroke_progress_map(component, direction):
     path_arr = np.array([[p[1], p[0]] for p in global_path], dtype=np.float32)
     pixel_points = np.column_stack((xs, ys)).astype(np.float32)
 
-    chunk_size = 2000
-    for i in range(0, len(pixel_points), chunk_size):
-        chunk = pixel_points[i:i + chunk_size]
+    chunk_size = 1000
+    num_pts = len(pixel_points)
+    path_len = float(max(1, len(path_arr) - 1))
+
+    for i in range(0, num_pts, chunk_size):
+        end_idx = min(i + chunk_size, num_pts)
+        chunk = pixel_points[i:end_idx]
+        chunk_ys = ys[i:end_idx]
+        chunk_xs = xs[i:end_idx]
+
         dists = np.sqrt(((chunk[:, None, :] - path_arr[None, :, :]) ** 2).sum(axis=2))
         nearest = np.argmin(dists, axis=1)
-        progress_map[ys[i:i + chunk_size], xs[i:i + chunk_size]] = nearest.astype(np.float32) / float(len(path_arr) - 1)
+        progress_map[chunk_ys, chunk_xs] = nearest.astype(np.float32) / path_len
 
     return global_path, progress_map
 
@@ -281,6 +299,7 @@ if uploaded_files:
                 st.error(f"Could not read image file: {file.name}")
                 continue
 
+            image = resize_if_large(image, max_dim=800)
             norm_img, binary_mask = preprocess_and_clean_background(image)
             components = extract_stroke_components(binary_mask)
 
@@ -345,13 +364,13 @@ if uploaded_files:
 
                     batch_progress.progress((idx + 1) / len(uploaded_files))
 
-        status_text.success("🎉 All animations rendered successfully!")
-        batch_progress.empty()
+            status_text.success("🎉 All animations rendered successfully!")
+            batch_progress.empty()
 
-        zip_buffer.seek(0)
-        st.download_button(
-            "📦 Download All Animations (.ZIP Folder)",
-            data=zip_buffer.getvalue(),
-            file_name="calligraphy_animations.zip",
-            mime="application/zip"
-        )
+            zip_buffer.seek(0)
+            st.download_button(
+                "📦 Download All Animations (.ZIP Folder)",
+                data=zip_buffer.getvalue(),
+                file_name="calligraphy_animations.zip",
+                mime="application/zip"
+            )
