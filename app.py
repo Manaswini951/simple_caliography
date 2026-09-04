@@ -168,7 +168,6 @@ def prepare_stroke_progress_map(component, direction):
     path_arr = np.array([[p[1], p[0]] for p in global_path], dtype=np.float32)
     pixel_points = np.column_stack((xs, ys)).astype(np.float32)
 
-    # Chunked distance comparison to prevent memory allocation spikes
     chunk_size = 2000
     for i in range(0, len(pixel_points), chunk_size):
         chunk = pixel_points[i:i + chunk_size]
@@ -309,7 +308,7 @@ if uploaded_files:
 
             processed_data[file.name] = {
                 "image": image,
-                 base_bg": base_bg,
+                "base_bg": base_bg,
                 "components": components
             }
 
@@ -346,13 +345,13 @@ if uploaded_files:
 
                     batch_progress.progress((idx + 1) / len(uploaded_files))
 
-            status_text.success("🎉 All animations rendered successfully!")
-            batch_progress.empty()
+        status_text.success("🎉 All animations rendered successfully!")
+        batch_progress.empty()
 
-            zip_buffer.seek(0)
-            st.download_button(
-                "📦 Download All Animations (.ZIP Folder)",
-                data=zip_buffer.getvalue(),
-                file_name="calligraphy_animations.zip",
-                mime="application/zip"
-            )
+        zip_buffer.seek(0)
+        st.download_button(
+            "📦 Download All Animations (.ZIP Folder)",
+            data=zip_buffer.getvalue(),
+            file_name="calligraphy_animations.zip",
+            mime="application/zip"
+        )
