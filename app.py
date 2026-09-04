@@ -25,8 +25,8 @@ st.write(
 # PREPROCESSING & SEGMENTATION
 # ============================================================
 
-def resize_if_large(img, max_dim=800):
-    """Downscales input image if it exceeds max dimensions to prevent memory crashes."""
+def resize_if_large(img, max_dim=600):
+    """Downscales image to keep memory consumption low on cloud environments."""
     h, w = img.shape[:2]
     if max(h, w) <= max_dim:
         return img
@@ -39,8 +39,8 @@ def resize_if_large(img, max_dim=800):
 def preprocess_and_clean_background(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    bg = cv2.dilate(gray, np.ones((19, 19), np.uint8))
-    bg = cv2.medianBlur(bg, 21)
+    bg = cv2.dilate(gray, np.ones((15, 15), np.uint8))
+    bg = cv2.medianBlur(bg, 15)
     
     diff = 255 - cv2.absdiff(gray, bg)
     norm = cv2.normalize(diff, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
@@ -53,7 +53,7 @@ def preprocess_and_clean_background(image):
     return norm, cleaned_binary
 
 
-def extract_stroke_components(binary_mask, min_area=60):
+def extract_stroke_components(binary_mask, min_area=50):
     num_labels, cc_labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
     components = []
 
@@ -76,7 +76,7 @@ def extract_stroke_components(binary_mask, min_area=60):
             "area": area,
         })
 
-    components.sort(key=lambda p: (p["bbox"][1] // 30, p["bbox"][0]))
+    components.sort(key=lambda p: (p["bbox"][1] // 25, p["bbox"][0]))
     return components
 
 
@@ -128,7 +128,7 @@ def generate_ordered_path(skeleton, direction="Left -> Right"):
         nearest = min(remaining, key=lambda p: ((p[0] - cy) ** 2 + (p[1] - cx) ** 2))
         
         dist_sq = (nearest[0] - cy) ** 2 + (nearest[1] - cx) ** 2
-        if dist_sq > 2500:
+        if dist_sq > 1600:
             break
 
         path.append(nearest)
@@ -138,7 +138,7 @@ def generate_ordered_path(skeleton, direction="Left -> Right"):
     return path
 
 
-def smooth_stroke_path(path, window_size=9):
+def smooth_stroke_path(path, window_size=7):
     if len(path) < window_size:
         return path
 
@@ -177,21 +177,20 @@ def prepare_stroke_progress_map(component, direction):
         return global_path, progress_map
 
     path_arr = np.array([[p[1], p[0]] for p in global_path], dtype=np.float32)
-    pixel_points = np.column_stack((xs, ys)).astype(np.float32)
+    pixel_pts = np.column_stack((xs, ys)).astype(np.float32)
 
-    chunk_size = 1000
-    num_pts = len(pixel_points)
+    # Ultra-low RAM point-by-point distance indexing
+    min_dists = np.full(len(pixel_pts), 1e9, dtype=np.float32)
+    best_indices = np.zeros(len(pixel_pts), dtype=np.int32)
+
+    for p_idx, pt in enumerate(path_arr):
+        d_sq = (pixel_pts[:, 0] - pt[0]) ** 2 + (pixel_pts[:, 1] - pt[1]) ** 2
+        closer = d_sq < min_dists
+        min_dists[closer] = d_sq[closer]
+        best_indices[closer] = p_idx
+
     path_len = float(max(1, len(path_arr) - 1))
-
-    for i in range(0, num_pts, chunk_size):
-        end_idx = min(i + chunk_size, num_pts)
-        chunk = pixel_points[i:end_idx]
-        chunk_ys = ys[i:end_idx]
-        chunk_xs = xs[i:end_idx]
-
-        dists = np.sqrt(((chunk[:, None, :] - path_arr[None, :, :]) ** 2).sum(axis=2))
-        nearest = np.argmin(dists, axis=1)
-        progress_map[chunk_ys, chunk_xs] = nearest.astype(np.float32) / path_len
+    progress_map[ys, xs] = best_indices.astype(np.float32) / path_len
 
     return global_path, progress_map
 
@@ -205,7 +204,7 @@ def ease_in_out(t):
     return t * t * (3.0 - 2.0 * t)
 
 
-def render_artistic_nib(canvas, point, angle=45, nib_size=6, color=(20, 20, 20)):
+def render_artistic_nib(canvas, point, angle=45, nib_size=5, color=(20, 20, 20)):
     if point is None:
         return
     
@@ -280,7 +279,7 @@ st.sidebar.header("🎨 Global Writing Settings")
 canvas_style = st.sidebar.selectbox("Background Style", ["Pure White Canvas", "Cleaned Paper Texture", "Original Image"])
 writing_direction = st.sidebar.selectbox("Default Writing Direction", ["Left -> Right", "Top -> Bottom", "Right -> Left"])
 show_nib = st.sidebar.checkbox("Show Calligraphy Pen Tip", value=True)
-total_frames = st.sidebar.slider("Total Frames per GIF", 30, 180, 75, step=5)
+total_frames = st.sidebar.slider("Total Frames per GIF", 30, 120, 60, step=5)
 gif_speed = st.sidebar.slider("Frame Delay (ms)", 20, 100, 40, step=5)
 
 if uploaded_files:
@@ -299,7 +298,7 @@ if uploaded_files:
                 st.error(f"Could not read image file: {file.name}")
                 continue
 
-            image = resize_if_large(image, max_dim=800)
+            image = resize_if_large(image, max_dim=600)
             norm_img, binary_mask = preprocess_and_clean_background(image)
             components = extract_stroke_components(binary_mask)
 
